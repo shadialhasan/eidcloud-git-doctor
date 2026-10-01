@@ -1,0 +1,35 @@
+{
+  "name": "eidcloud/git-doctor",
+  "description": "Git repository intelligence and health auditor diagnosing large blobs, bus factor, stale branches, and churn in pure PHP",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Eng. MHD. Shadi AL-Hasan",
+      "role": "Author & Maintainer"
+    }
+  ],
+  "require": {
+    "php": ">=8.2.0"
+  },
+  "autoload": {
+    "psr-4": {
+      "EidCloud\\GitDoctor\\": "src/"
+    }
+  },
+  "bin": [
+    "bin/eidcloud-git-doctor"
+  ],
+  "keywords": [
+    "eidcloud",
+    "git-doctor",
+    "git-analytics",
+    "repo-health",
+    "bus-factor",
+    "git-diagnostics",
+    "php8"
+  ],
+  "scripts": {
+    "test": "php tests/run_tests.php"
+  }
+}

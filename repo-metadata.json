@@ -1,0 +1,12 @@
+{
+  "description": "Git repository intelligence and health auditor diagnosing large blobs, bus factor, stale branches, and churn in pure PHP",
+  "topics": [
+    "eidcloud",
+    "git-doctor",
+    "git-analytics",
+    "repo-health",
+    "bus-factor",
+    "git-diagnostics",
+    "php8"
+  ]
+}

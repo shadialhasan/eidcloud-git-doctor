@@ -1,0 +1,319 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Zero external vendor dependency autoloader
+require_once __DIR__ . '/../src/autoload.php';
+
+use EidCloud\GitDoctor\Auditors\LargeFileAuditor;
+use EidCloud\GitDoctor\GitDoctor;
+
+function printBanner(): void
+{
+    echo "\033[1;36m";
+    echo "========================================================================\n";
+    echo " 🩺  eidcloud-git-doctor v" . GitDoctor::VERSION . " | Git Intelligence & Forensic Auditor\n";
+    echo "========================================================================\n";
+    echo "\033[0m";
+}
+
+function printHelp(): void
+{
+    printBanner();
+    echo <<<HELP
+\033[1;33mUSAGE:\033[0m
+  php bin/eidcloud-git-doctor <command> [repository-path] [options]
+
+\033[1;33mCOMMANDS:\033[0m
+  \033[1;32mdiagnose\033[0m [path]           Run complete forensic audit (hygiene, bus factor, branches, release)
+  \033[1;32mlarge-files\033[0m [path]        Scan repository for oversized blobs and duplicate files
+  \033[1;32mbus-factor\033[0m [path]         Analyze author velocity, contributor distribution, and churn hotspots
+  \033[1;32mbranches\033[0m [path]           Inspect stale, merged, and dangling branch references
+  \033[1;32mrelease\033[0m [path]            Audit SemVer tags, CHANGELOG, LICENSE, README, and CI/CD
+  \033[1;32mremediate\033[0m [path]          Generate git-prune.sh and git-prune.ps1 automated cleanup scripts
+
+\033[1;33mOPTIONS:\033[0m
+  --threshold=<size>        Size threshold for large files (e.g. 10MB, 50MB, 1GB). Default: 50MB
+  --stale-days=<days>       Threshold in days for stale branches. Default: 90
+  --json                    Output results as clean JSON
+  --script-out=<dir>        Directory to write generated remediation scripts (used with remediate/diagnose)
+  -h, --help                Show this help screen
+  -v, --version             Show version information
+
+\033[1;33mEXAMPLES:\033[0m
+  php bin/eidcloud-git-doctor diagnose .
+  php bin/eidcloud-git-doctor large-files . --threshold=10MB
+  php bin/eidcloud-git-doctor bus-factor .
+  php bin/eidcloud-git-doctor release .
+  php bin/eidcloud-git-doctor remediate . --script-out=./scripts
+
+HELP;
+}
+
+$argvCopy = $argv;
+array_shift($argvCopy); // remove script name
+
+if (count($argvCopy) === 0 || in_array('-h', $argvCopy, true) || in_array('--help', $argvCopy, true)) {
+    printHelp();
+    exit(0);
+}
+
+if (in_array('-v', $argvCopy, true) || in_array('--version', $argvCopy, true)) {
+    echo "eidcloud-git-doctor version " . GitDoctor::VERSION . "\n";
+    exit(0);
+}
+
+$command = array_shift($argvCopy);
+$repoPath = '.';
+$thresholdStr = '50MB';
+$staleDays = 90;
+$jsonOutput = false;
+$scriptOutDir = null;
+
+while (!empty($argvCopy)) {
+    $arg = array_shift($argvCopy);
+    if ($arg === '--json') {
+        $jsonOutput = true;
+    } elseif (str_starts_with($arg, '--threshold=')) {
+        $thresholdStr = substr($arg, strlen('--threshold='));
+    } elseif (str_starts_with($arg, '--stale-days=')) {
+        $staleDays = (int)substr($arg, strlen('--stale-days='));
+    } elseif (str_starts_with($arg, '--script-out=')) {
+        $scriptOutDir = substr($arg, strlen('--script-out='));
+    } elseif (!str_starts_with($arg, '-')) {
+        $repoPath = $arg;
+    }
+}
+
+$thresholdBytes = LargeFileAuditor::parseThreshold($thresholdStr);
+
+try {
+    $doctor = new GitDoctor($repoPath);
+} catch (\Throwable $e) {
+    if ($jsonOutput) {
+        echo json_encode(['error' => $e->getMessage()], JSON_PRETTY_PRINT) . "\n";
+    } else {
+        echo "\033[1;31mError:\033[0m " . $e->getMessage() . "\n";
+    }
+    exit(1);
+}
+
+switch ($command) {
+    case 'diagnose':
+        $res = $doctor->diagnose($thresholdBytes, $staleDays);
+        if ($jsonOutput) {
+            echo json_encode($res, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            exit(0);
+        }
+
+        printBanner();
+        $sc = $res['scorecard'];
+        $gradeColor = match ($sc['grade']) {
+            'A+', 'A' => "\033[1;32m",
+            'B' => "\033[1;34m",
+            'C' => "\033[1;33m",
+            default => "\033[1;31m",
+        };
+
+        echo "Repo Path:    " . $res['repo_path'] . "\n";
+        echo "Health Grade: {$gradeColor}[ " . $sc['grade'] . " ]\033[0m (Score: " . $sc['overall_score'] . "/100)\n";
+        echo "Verdict:      " . $sc['verdict'] . "\n\n";
+
+        echo "\033[1;33mCategory Breakdown:\033[0m\n";
+        foreach ($sc['breakdown'] as $cat => $details) {
+            $catName = ucwords(str_replace('_', ' ', $cat));
+            $statusColor = match ($details['status']) {
+                'PASSED' => "\033[32m✔ PASSED\033[0m",
+                'WARNING' => "\033[33m▲ WARNING\033[0m",
+                default => "\033[31m✖ FAILED\033[0m",
+            };
+            printf("  %-20s %s (%d/%d pts) - %s\n", $catName . ':', $statusColor, $details['score'], $details['max'], $details['summary']);
+        }
+
+        if (!empty($sc['action_items'])) {
+            echo "\n\033[1;33mPrescribed Action Items:\033[0m\n";
+            foreach ($sc['action_items'] as $idx => $item) {
+                echo "  [" . ($idx + 1) . "] {$item}\n";
+            }
+        }
+
+        if ($scriptOutDir !== null) {
+            if (!is_dir($scriptOutDir)) {
+                mkdir($scriptOutDir, 0755, true);
+            }
+            file_put_contents($scriptOutDir . '/git-prune.sh', $res['remediation']['bash_prune_script']);
+            file_put_contents($scriptOutDir . '/git-prune.ps1', $res['remediation']['powershell_prune_script']);
+            file_put_contents($scriptOutDir . '/LFS_MIGRATION.md', $res['remediation']['lfs_advice']);
+            echo "\n\033[1;32mGenerated remediation scripts saved to:\033[0m {$scriptOutDir}\n";
+        }
+        break;
+
+    case 'large-files':
+        $res = $doctor->getLargeFileAuditor()->audit($thresholdBytes);
+        if ($jsonOutput) {
+            echo json_encode($res, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            exit(0);
+        }
+
+        printBanner();
+        echo "Large Files & Blobs Scan (Threshold: >= {$res['threshold_formatted']}):\n";
+        echo "Total Blobs: {$res['total_blob_count']} | Total Size: " . LargeFileAuditor::formatBytes($res['total_blob_size_bytes']) . "\n\n";
+
+        if (empty($res['oversized_blobs'])) {
+            echo "\033[1;32m✔ No oversized blobs found exceeding threshold.\033[0m\n";
+        } else {
+            echo "\033[1;31mFound " . count($res['oversized_blobs']) . " oversized blobs:\033[0m\n";
+            foreach ($res['oversized_blobs'] as $b) {
+                echo "  • {$b['size_formatted']} [{$b['hash']}] -> {$b['path']}\n";
+            }
+        }
+
+        if (!empty($res['duplicates'])) {
+            echo "\n\033[1;33mDuplicate Blobs in Tree (" . count($res['duplicates']) . " detected):\033[0m\n";
+            foreach ($res['duplicates'] as $d) {
+                echo "  • Hash {$d['hash']} ({$d['size_formatted']}):\n";
+                foreach ($d['paths'] as $p) {
+                    echo "      - {$p}\n";
+                }
+            }
+        }
+        break;
+
+    case 'bus-factor':
+        $res = $doctor->getBusFactorAuditor()->audit();
+        if ($jsonOutput) {
+            echo json_encode($res, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            exit(0);
+        }
+
+        printBanner();
+        $riskColor = match ($res['bus_factor_risk']) {
+            'HEALTHY' => "\033[1;32m",
+            'MODERATE' => "\033[1;34m",
+            'HIGH' => "\033[1;33m",
+            default => "\033[1;31m",
+        };
+
+        echo "Total Commits: {$res['total_commits']} | Total Authors: {$res['author_count']}\n";
+        echo "Bus Factor:    {$riskColor}" . $res['bus_factor'] . " (" . $res['bus_factor_risk'] . " RISK)\033[0m\n";
+        echo "Velocity:      {$res['velocity']['commits_per_week']} commits/week (over {$res['velocity']['total_days']} days)\n\n";
+
+        echo "\033[1;33mTop Contributors:\033[0m\n";
+        foreach ($res['top_contributors'] as $c) {
+            printf("  %-30s %5d commits (%5.1f%%) <%s>\n", $c['author'], $c['commits'], $c['percentage'], $c['email']);
+        }
+
+        if (!empty($res['churn_hotspots'])) {
+            echo "\n\033[1;33mActive Churn Hotspots (Frequent modifications):\033[0m\n";
+            foreach ($res['churn_hotspots'] as $ch) {
+                printf("  %-50s (%d modifications)\n", $ch['file'], $ch['modifications']);
+            }
+        }
+
+        $ln = $res['late_night_commits'];
+        $lnColor = $ln['warning'] ? "\033[1;31m" : "\033[1;32m";
+        echo "\nLate-Night Commits (23:00 - 05:00): {$lnColor}{$ln['count']} ({$ln['percentage']}%)\033[0m\n";
+        if ($ln['warning']) {
+            echo "  ⚠️  Warning: >25% late-night commits suggests irregular work hours or crunch patterns.\n";
+        }
+        break;
+
+    case 'branches':
+        $res = $doctor->getBranchAuditor()->audit($staleDays);
+        if ($jsonOutput) {
+            echo json_encode($res, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            exit(0);
+        }
+
+        printBanner();
+        echo "Default Branch:  {$res['default_branch']}\n";
+        echo "Total Branches:  {$res['total_branches']}\n";
+        echo "Dangling Commits: {$res['dangling_count']}\n\n";
+
+        echo "\033[1;33mMerged Local Branches (Safe to prune):\033[0m\n";
+        if (empty($res['merged_branches'])) {
+            echo "  ✔ None. Branch list is clean.\n";
+        } else {
+            foreach ($res['merged_branches'] as $b) {
+                echo "  • {$b}\n";
+            }
+        }
+
+        echo "\n\033[1;33mStale Branches (Inactive > {$staleDays} days):\033[0m\n";
+        if (empty($res['stale_branches'])) {
+            echo "  ✔ No stale branches found.\n";
+        } else {
+            foreach ($res['stale_branches'] as $sb) {
+                echo "  • {$sb['name']} (Last commit: {$sb['last_commit_date']} by {$sb['author']}, {$sb['days_inactive']} days ago)\n";
+            }
+        }
+        break;
+
+    case 'release':
+        $res = $doctor->getReleaseAuditor()->audit();
+        if ($jsonOutput) {
+            echo json_encode($res, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+            exit(0);
+        }
+
+        printBanner();
+        $statusStr = $res['ready'] ? "\033[1;32mREADY FOR RELEASE\033[0m" : "\033[1;31mNOT READY\033[0m";
+        echo "Release Readiness: {$statusStr} (Score: {$res['score']}/100)\n\n";
+
+        echo "  • SemVer Tagging: " . ($res['semver']['has_tags'] ? "✔ (Latest: {$res['semver']['latest_tag']})" : "✖ No tags found") . "\n";
+        echo "  • CHANGELOG:      " . ($res['changelog']['exists'] ? "✔ Found ({$res['changelog']['file']})" : "✖ Missing") . "\n";
+        echo "  • LICENSE:        " . ($res['license']['exists'] ? "✔ Found ({$res['license']['detected_type']})" : "✖ Missing") . "\n";
+        echo "  • README:         " . ($res['readme']['exists'] ? "✔ Found ({$res['readme']['size_bytes']} bytes)" : "✖ Missing") . "\n";
+        echo "  • CI/CD Config:   " . ($res['cicd']['configured'] ? "✔ Configured (" . implode(', ', $res['cicd']['files']) . ")" : "✖ None") . "\n";
+
+        if (!empty($res['issues'])) {
+            echo "\n\033[1;31mDefects Detected:\033[0m\n";
+            foreach ($res['issues'] as $issue) {
+                echo "  ✖ {$issue}\n";
+            }
+        }
+
+        if (!empty($res['recommendations'])) {
+            echo "\n\033[1;33mRecommendations:\033[0m\n";
+            foreach ($res['recommendations'] as $rec) {
+                echo "  👉 {$rec}\n";
+            }
+        }
+        break;
+
+    case 'remediate':
+        $branchAudit = $doctor->getBranchAuditor()->audit();
+        $largeFileAudit = $doctor->getLargeFileAuditor()->audit($thresholdBytes);
+
+        $bash = \EidCloud\GitDoctor\Remediation\RemediationGenerator::generateBashPruneScript(
+            $branchAudit['merged_branches'],
+            $largeFileAudit['oversized_blobs'],
+            $branchAudit['dangling_count']
+        );
+        $ps = \EidCloud\GitDoctor\Remediation\RemediationGenerator::generatePowerShellPruneScript(
+            $branchAudit['merged_branches'],
+            $largeFileAudit['oversized_blobs'],
+            $branchAudit['dangling_count']
+        );
+        $lfs = \EidCloud\GitDoctor\Remediation\RemediationGenerator::generateLfsAdvice($largeFileAudit['oversized_blobs']);
+
+        if ($scriptOutDir !== null) {
+            if (!is_dir($scriptOutDir)) {
+                mkdir($scriptOutDir, 0755, true);
+            }
+            file_put_contents($scriptOutDir . '/git-prune.sh', $bash);
+            file_put_contents($scriptOutDir . '/git-prune.ps1', $ps);
+            file_put_contents($scriptOutDir . '/LFS_MIGRATION.md', $lfs);
+            echo "Remediation files generated in {$scriptOutDir}:\n  • git-prune.sh\n  • git-prune.ps1\n  • LFS_MIGRATION.md\n";
+        } else {
+            echo "### Bash Remediation Script (git-prune.sh):\n\n" . $bash . "\n";
+            echo "### PowerShell Remediation Script (git-prune.ps1):\n\n" . $ps . "\n";
+        }
+        break;
+
+    default:
+        echo "\033[1;31mUnknown command:\033[0m {$command}\n";
+        printHelp();
+        exit(1);
+}
